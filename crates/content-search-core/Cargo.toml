@@ -1,0 +1,20 @@
+[package]
+name = "content-search-core"
+version = "0.1.1"
+edition = "2021"
+description = "Core primitives for content search, large-file viewing, and replace workflows"
+license = "MIT"
+repository = "https://github.com/Aar0n3906/content-search"
+keywords = ["content-search", "large-file", "trace-viewer", "log-viewer"]
+categories = ["text-processing"]
+
+[dependencies]
+anyhow = "1.0"
+bincode = "1.3"
+encoding_rs = "0.8"
+memmap2 = "0.9"
+regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"

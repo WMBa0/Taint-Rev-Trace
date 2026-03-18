@@ -1,0 +1,23 @@
+[package]
+name = "content-search"
+version = "0.1.0"
+edition = "2021"
+description = "A content search and trace exploration GUI for large files"
+license = "MIT"
+repository = "https://github.com/Aar0n3906/content-search"
+keywords = ["gui", "content-search", "trace-viewer"]
+categories = ["gui", "visualization"]
+
+[workspace]
+members = ["crates/content-search-core", "crates/arm64-taint-core"]
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+notify = "6.1"
+rfd = "0.15"
+anyhow = "1.0"
+encoding_rs = "0.8"
+arm64-taint-core = { path = "crates/arm64-taint-core", version = "0.1.0" }
+content-search-core = { path = "crates/content-search-core", version = "0.1.1" }
+regex = "1.10"
