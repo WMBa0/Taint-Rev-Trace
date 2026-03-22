@@ -14,5 +14,10 @@ encoding_rs = "0.8"
 memchr = "2"
 content-search-core = { path = "../content-search-core", version = "0.1.1" }
 regex = "1.10"
+rmcp = { version = "1.2.0", features = ["transport-io"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"

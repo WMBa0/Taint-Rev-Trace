@@ -1,3 +1,7 @@
+use crate::mcp_install::{
+    detect_any_global_mcp, detect_supported_client_names, install_to_detected_clients,
+    preferred_global_config_paths, remove_from_detected_clients,
+};
 use arm64_taint_core::{
     trace_backward_streaming, BackwardTaintOptions, BackwardTaintReport, BackwardTaintRequest,
     Confidence, DataFlowNode, EdgeReason, StreamingTrace, TargetKind,
@@ -6,6 +10,7 @@ use eframe::egui;
 use encoding_rs::Encoding;
 use notify::{RecursiveMode, Result as NotifyResult, Watcher};
 use regex::Regex;
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
@@ -77,6 +82,7 @@ pub struct TextViewerApp {
 
     // Status messages
     status_message: String,
+    mcp_status_message: Option<String>,
 
     // Encoding
     selected_encoding: &'static Encoding,
@@ -103,6 +109,7 @@ pub struct TextViewerApp {
     taint_mem_input: String,
     taint_bit_lo_input: String,
     taint_bit_hi_input: String,
+    taint_depth_input: String,
     taint_output_limit_input: String,
     taint_prune_equal_value_loads: bool,
     taint_in_progress: bool,
@@ -112,6 +119,8 @@ pub struct TextViewerApp {
     taint_selected_line: Option<usize>,
     taint_hover_target: Option<TaintSelectionTarget>,
     taint_last_target: Option<TaintSelectionTarget>,
+    mcp_enabled: bool,
+    mcp_detected_clients: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -138,6 +147,21 @@ fn tr_lang<'a>(lang: UiLanguage, en: &'a str, zh: &'a str) -> &'a str {
         UiLanguage::English => en,
         UiLanguage::Chinese => zh,
     }
+}
+
+const MCP_SERVER_NAME: &str = "taint-rev-trace";
+
+#[derive(Clone)]
+struct McpLaunchSpec {
+    command: String,
+    args: Vec<String>,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct McpConfigOutcome {
+    path: PathBuf,
+    method: &'static str,
 }
 
 enum TaintUiMessage {
@@ -207,6 +231,7 @@ impl Default for TextViewerApp {
             watcher: None,
             file_change_rx: None,
             status_message: String::new(),
+            mcp_status_message: None,
             selected_encoding: encoding_rs::UTF_8,
             show_encoding_selector: false,
             focus_search_input: false,
@@ -221,6 +246,7 @@ impl Default for TextViewerApp {
             taint_mem_input: String::new(),
             taint_bit_lo_input: "0".to_string(),
             taint_bit_hi_input: "31".to_string(),
+            taint_depth_input: "64".to_string(),
             taint_output_limit_input: "10000".to_string(),
             taint_prune_equal_value_loads: true,
             taint_in_progress: false,
@@ -230,6 +256,8 @@ impl Default for TextViewerApp {
             taint_selected_line: None,
             taint_hover_target: None,
             taint_last_target: None,
+            mcp_enabled: detect_global_mcp_enabled(),
+            mcp_detected_clients: detect_supported_client_names(),
         }
     }
 }
@@ -248,6 +276,290 @@ impl TextViewerApp {
 
     fn app_title_unsaved(&self) -> &'static str {
         self.tr("Taint Rev Trace *", "Taint Rev Trace *")
+    }
+
+    fn workspace_root(&self) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn global_mcp_config_path(&self) -> Option<PathBuf> {
+        vscode_user_mcp_config_path()
+    }
+
+    #[allow(dead_code)]
+    fn mcp_config_path(&self) -> PathBuf {
+        self.global_mcp_config_path()
+            .unwrap_or_else(|| self.workspace_root().join(".vscode").join("mcp.json"))
+    }
+
+    fn trace_search_mcp_launch_spec(&self) -> McpLaunchSpec {
+        let workspace_root = self.workspace_root();
+        let executable_name = if cfg!(windows) {
+            "trace-search-mcp.exe"
+        } else {
+            "trace-search-mcp"
+        };
+
+        for candidate in [
+            workspace_root.join("target").join("debug").join(executable_name),
+            workspace_root.join("target").join("release").join(executable_name),
+        ] {
+            if candidate.exists() {
+                return McpLaunchSpec {
+                    command: candidate.display().to_string(),
+                    args: Vec::new(),
+                };
+            }
+        }
+
+        McpLaunchSpec {
+            command: "cargo".to_string(),
+            args: vec![
+                "run".to_string(),
+                "--manifest-path".to_string(),
+                workspace_root.join("Cargo.toml").display().to_string(),
+                "-p".to_string(),
+                "arm64-taint-core".to_string(),
+                "--bin".to_string(),
+                "trace-search-mcp".to_string(),
+            ],
+        }
+    }
+
+    #[allow(dead_code)]
+    fn set_mcp_enabled(&mut self, enabled: bool) {
+        match update_workspace_mcp_config(&self.trace_search_mcp_launch_spec(), enabled) {
+            Ok(path) => {
+                self.mcp_enabled = enabled;
+                self.mcp_status_message = Some(if enabled {
+                    self.tr(
+                        "Workspace MCP config enabled.",
+                        "工作区 MCP 配置已启用。",
+                    )
+                    .to_string()
+                } else {
+                    self.tr(
+                        "Workspace MCP config disabled.",
+                        "工作区 MCP 配置已关闭。",
+                    )
+                    .to_string()
+                });
+                self.status_message = if enabled {
+                    format!(
+                        "{}: {}",
+                        self.tr("MCP config written", "MCP 配置已写入"),
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "{}: {}",
+                        self.tr("MCP config updated", "MCP 配置已更新"),
+                        path.display()
+                    )
+                };
+            }
+            Err(err) => {
+                self.mcp_enabled = detect_workspace_mcp_enabled();
+                self.mcp_status_message = Some(format!(
+                    "{}: {}",
+                    self.tr("MCP update failed", "MCP 更新失败"),
+                    err
+                ));
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn configure_mcp_one_click(&mut self) {
+        self.set_mcp_enabled(true);
+    }
+
+    fn set_global_mcp_enabled(&mut self, enabled: bool) {
+        let launch = self.trace_search_mcp_launch_spec();
+        let report = if enabled {
+            install_to_detected_clients(MCP_SERVER_NAME, &launch.command, &launch.args)
+        } else {
+            remove_from_detected_clients(MCP_SERVER_NAME)
+        };
+
+        self.mcp_detected_clients = report.detected_clients.clone();
+        self.mcp_enabled = detect_global_mcp_enabled();
+        self.status_message = report.summary_text();
+        self.mcp_status_message = Some(report.detail_text());
+
+        if report.success_count() == 0 && report.has_errors() {
+            self.mcp_status_message = Some(format!(
+                "{}: {}",
+                self.tr("MCP update failed", "MCP 更新失败"),
+                report.detail_text()
+            ));
+        }
+    }
+
+    fn configure_global_mcp_one_click(&mut self) {
+        self.set_global_mcp_enabled(true);
+    }
+
+    #[allow(dead_code)]
+    fn render_global_mcp_section(&mut self, ui: &mut egui::Ui) {
+        ui.strong(self.tr("MCP", "MCP"));
+        let launch = self.trace_search_mcp_launch_spec();
+
+        let mut enabled = self.mcp_enabled;
+        if ui
+            .checkbox(
+                &mut enabled,
+                self.tr(
+                    "Enable global MCP install",
+                    "启用全局 MCP 安装",
+                ),
+            )
+            .changed()
+        {
+            self.set_global_mcp_enabled(enabled);
+        }
+
+        if ui
+            .button(self.tr(
+                "One-click Install To Detected Clients",
+                "一键安装到已检测客户端",
+            ))
+            .clicked()
+        {
+            self.configure_global_mcp_one_click();
+        }
+
+        ui.small(self.tr(
+            "This installs the MCP server into detected global IDE and CLI configs on this machine, not just this workspace.",
+            "这会把 MCP 服务安装到这台机器上已检测到的 IDE 和 CLI 的全局配置里，而不只是当前工作区。",
+        ));
+        ui.small(self.tr(
+            "It uses each client's global config or official CLI flow when available.",
+            "它会优先使用各客户端自己的全局配置或官方 CLI 安装流程。",
+        ));
+        ui.small(format!(
+            "{}: {}",
+            self.tr("Detected Clients", "已检测客户端"),
+            if self.mcp_detected_clients.is_empty() {
+                self.tr("none", "无").to_string()
+            } else {
+                self.mcp_detected_clients.join(", ")
+            }
+        ));
+        ui.small(format!(
+            "{}: {}",
+            self.tr("Primary Config Paths", "主要配置路径"),
+            {
+                let paths = preferred_global_config_paths();
+                if paths.is_empty() {
+                    self.tr("Unavailable on this platform", "当前平台不可用").to_string()
+                } else {
+                    paths
+                        .into_iter()
+                        .take(3)
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                }
+            }
+        ));
+        ui.small(format!(
+            "{}: {} {}",
+            self.tr("Server Command", "服务命令"),
+            launch.command,
+            launch.args.join(" ")
+        ));
+
+        if let Some(message) = &self.mcp_status_message {
+            ui.small(message);
+        }
+    }
+
+    fn render_global_mcp_section_compact(&mut self, ui: &mut egui::Ui) {
+        ui.strong(self.tr("MCP", "MCP"));
+
+        let mut enabled = self.mcp_enabled;
+        if ui
+            .checkbox(
+                &mut enabled,
+                self.tr("Enable global MCP install", "启用全局 MCP 安装"),
+            )
+            .changed()
+        {
+            self.set_global_mcp_enabled(enabled);
+        }
+
+        if ui
+            .button(self.tr(
+                "One-click Install To Detected Clients",
+                "一键安装到已检测客户端",
+            ))
+            .clicked()
+        {
+            self.configure_global_mcp_one_click();
+        }
+        ui.small(format!(
+            "{}: {}",
+            self.tr("Detected Clients", "已检测客户端"),
+            if self.mcp_detected_clients.is_empty() {
+                self.tr("none", "无").to_string()
+            } else {
+                self.mcp_detected_clients.join(", ")
+            }
+        ));
+
+        if let Some(message) = &self.mcp_status_message {
+            ui.small(message);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn render_mcp_section(&mut self, ui: &mut egui::Ui) {
+        let launch = self.trace_search_mcp_launch_spec();
+        ui.strong(self.tr("MCP", "MCP"));
+        let mut enabled = self.mcp_enabled;
+        if ui
+            .checkbox(
+                &mut enabled,
+                self.tr(
+                    "Enable workspace MCP config",
+                    "启用工作区 MCP 配置",
+                ),
+            )
+            .changed()
+        {
+            self.set_mcp_enabled(enabled);
+        }
+
+        if ui
+            .button(self.tr(
+                "One-click Configure VS Code",
+                "一键配置 VS Code MCP",
+            ))
+            .clicked()
+        {
+            self.configure_mcp_one_click();
+        }
+
+        ui.small(self.tr(
+            "This writes or updates .vscode/mcp.json for the current workspace.",
+            "这会为当前工作区写入或更新 .vscode/mcp.json。",
+        ));
+        ui.small(format!(
+            "{}: {}",
+            self.tr("Config Path", "配置路径"),
+            self.mcp_config_path().display()
+        ));
+        ui.small(format!(
+            "{}: {} {}",
+            self.tr("Server Command", "服务命令"),
+            launch.command,
+            launch.args.join(" ")
+        ));
+
+        if let Some(message) = &self.mcp_status_message {
+            ui.small(message);
+        }
     }
 
     #[allow(dead_code)]
@@ -1107,6 +1419,19 @@ impl TextViewerApp {
                 return;
             }
         };
+        let max_depth = match self.taint_depth_input.trim().parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                self.taint_error = Some(
+                    self.tr(
+                        "Invalid trace depth",
+                        "无效的追踪深度",
+                    )
+                    .to_string(),
+                );
+                return;
+            }
+        };
         let max_nodes = match self.taint_output_limit_input.trim().parse::<usize>() {
             Ok(value) if value > 0 => value,
             _ => {
@@ -1166,6 +1491,7 @@ impl TextViewerApp {
             bit_lo,
             bit_hi,
             options: BackwardTaintOptions {
+                max_depth,
                 max_nodes,
                 prune_equal_value_loads: self.taint_prune_equal_value_loads,
                 ..BackwardTaintOptions::default()
@@ -1260,13 +1586,7 @@ impl TextViewerApp {
             .resizable(true)
             .default_width(460.0)
             .show(ctx, |ui| {
-                ui.heading(self.tr("Tools", "工具"));
-                ui.small(self.tr(
-                    "Backward taint is pinned here so trace browsing and source analysis stay together.",
-                    "反向污点追踪固定在这里，便于把追踪浏览和来源分析放在同一处。",
-                ));
-                ui.separator();
-                ui.strong(self.tr("Backward Taint", "反向污点追踪"));
+                ui.heading(self.tr("Backward Taint", "反向污点追踪"));
 
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.taint_target_mode, TaintTargetMode::Reg, "Reg");
@@ -1294,9 +1614,15 @@ impl TextViewerApp {
                             .desired_width(80.0)
                             .hint_text("10000"),
                     );
+                    ui.label(self.tr("Depth", "深度"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.taint_depth_input)
+                            .desired_width(56.0)
+                            .hint_text("64"),
+                    );
                     ui.small(self.tr(
-                        "Max nodes in the taint result graph",
-                        "污点结果图中最多节点数",
+                        "Max nodes and expansion depth in the taint result graph",
+                        "污点结果图的最大节点数和展开深度",
                     ));
                 });
                 let prune_label = self.tr(
@@ -1431,6 +1757,11 @@ impl TextViewerApp {
                         self.tr("Limit", "上限"),
                         report.request.options.max_nodes,
                         self.tr("nodes", "节点")
+                    ));
+                    ui.label(format!(
+                        "{}: {}",
+                        self.tr("Depth", "深度"),
+                        report.request.options.max_depth
                     ));
                 });
                 ui.add_space(4.0);
@@ -2029,10 +2360,7 @@ impl TextViewerApp {
                         }
                     }
                     ui.separator();
-                    ui.small(self.tr(
-                        "Backward taint is pinned in the right tool panel.",
-                        "反向污点追踪已固定在右侧工具面板。",
-                    ));
+                    self.render_global_mcp_section_compact(ui);
                 });
 
                 ui.menu_button(self.tr("Language", "语言"), |ui| {
@@ -2789,6 +3117,255 @@ impl eframe::App for TextViewerApp {
         self.render_encoding_selector(ctx);
         self.render_file_info(ctx);
     }
+}
+
+fn detect_global_mcp_enabled() -> bool {
+    detect_any_global_mcp(MCP_SERVER_NAME)
+}
+
+fn vscode_user_mcp_config_path() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .map(|base| base.join("Code").join("User").join("mcp.json"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|base| {
+                base.join("Library")
+                    .join("Application Support")
+                    .join("Code")
+                    .join("User")
+                    .join("mcp.json")
+            })
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|base| base.join(".config").join("Code").join("User").join("mcp.json"))
+    }
+}
+
+#[allow(dead_code)]
+fn mcp_config_contains_server(path: &std::path::Path, server_name: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    root.get("servers")
+        .and_then(Value::as_object)
+        .map(|servers| servers.contains_key(server_name))
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)]
+fn install_global_mcp_config(launch: &McpLaunchSpec) -> anyhow::Result<McpConfigOutcome> {
+    if let Some(outcome) = try_install_global_mcp_via_code_cli(launch)? {
+        return Ok(outcome);
+    }
+
+    let path = write_named_mcp_server_config(
+        vscode_user_mcp_config_path()
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve VS Code global mcp.json path"))?,
+        Some(launch),
+    )?;
+    Ok(McpConfigOutcome {
+        path,
+        method: "direct file write",
+    })
+}
+
+#[allow(dead_code)]
+fn remove_global_mcp_config() -> anyhow::Result<McpConfigOutcome> {
+    let path = write_named_mcp_server_config(
+        vscode_user_mcp_config_path()
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve VS Code global mcp.json path"))?,
+        None,
+    )?;
+    Ok(McpConfigOutcome {
+        path,
+        method: "direct file write",
+    })
+}
+
+#[allow(dead_code)]
+fn try_install_global_mcp_via_code_cli(
+    launch: &McpLaunchSpec,
+) -> anyhow::Result<Option<McpConfigOutcome>> {
+    let Some(code_cli) = find_vscode_cli() else {
+        return Ok(None);
+    };
+
+    let payload = serde_json::to_string(&json!({
+        "name": MCP_SERVER_NAME,
+        "command": launch.command,
+        "args": launch.args,
+    }))?;
+
+    let output = std::process::Command::new(&code_cli)
+        .arg("--add-mcp")
+        .arg(payload)
+        .output();
+
+    match output {
+        Ok(result) if result.status.success() => Ok(Some(McpConfigOutcome {
+            path: vscode_user_mcp_config_path()
+                .unwrap_or_else(|| PathBuf::from("<VS Code user mcp.json>")),
+            method: "code --add-mcp",
+        })),
+        Ok(_) => Ok(None),
+        Err(_) => Ok(None),
+    }
+}
+
+#[allow(dead_code)]
+fn find_vscode_cli() -> Option<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("code"),
+        PathBuf::from("code.cmd"),
+        PathBuf::from("code-insiders"),
+        PathBuf::from("code-insiders.cmd"),
+    ];
+
+    if cfg!(target_os = "windows") {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let base = PathBuf::from(local_app_data);
+            candidates.push(
+                base.join("Programs")
+                    .join("Microsoft VS Code")
+                    .join("bin")
+                    .join("code.cmd"),
+            );
+            candidates.push(
+                base.join("Programs")
+                    .join("Microsoft VS Code Insiders")
+                    .join("bin")
+                    .join("code-insiders.cmd"),
+            );
+        }
+    }
+
+    candidates.into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
+
+#[allow(dead_code)]
+fn write_named_mcp_server_config(
+    path: PathBuf,
+    launch: Option<&McpLaunchSpec>,
+) -> anyhow::Result<PathBuf> {
+    let mut root = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    if !root.is_object() {
+        root = json!({});
+    }
+    let object = root.as_object_mut().expect("object");
+
+    let servers_value = object
+        .entry("servers".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !servers_value.is_object() {
+        *servers_value = Value::Object(Map::new());
+    }
+
+    let servers = servers_value.as_object_mut().expect("servers object");
+    if let Some(launch) = launch {
+        servers.insert(
+            MCP_SERVER_NAME.to_string(),
+            json!({
+                "command": launch.command,
+                "args": launch.args,
+            }),
+        );
+    } else {
+        servers.remove(MCP_SERVER_NAME);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    Ok(path)
+}
+
+#[allow(dead_code)]
+fn detect_workspace_mcp_enabled() -> bool {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".vscode")
+        .join("mcp.json");
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    root.get("servers")
+        .and_then(Value::as_object)
+        .map(|servers| servers.contains_key(MCP_SERVER_NAME))
+        .unwrap_or(false)
+}
+
+#[allow(dead_code)]
+fn update_workspace_mcp_config(launch: &McpLaunchSpec, enabled: bool) -> anyhow::Result<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".vscode")
+        .join("mcp.json");
+
+    let mut root = if path.exists() {
+        let content = std::fs::read_to_string(&path)?;
+        serde_json::from_str::<Value>(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    if !root.is_object() {
+        root = json!({});
+    }
+    let object = root.as_object_mut().expect("object");
+
+    let servers_value = object
+        .entry("servers".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !servers_value.is_object() {
+        *servers_value = Value::Object(Map::new());
+    }
+
+    let servers = servers_value.as_object_mut().expect("servers object");
+    if enabled {
+        servers.insert(
+            MCP_SERVER_NAME.to_string(),
+            json!({
+                "command": launch.command,
+                "args": launch.args,
+            }),
+        );
+    } else {
+        servers.remove(MCP_SERVER_NAME);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&root)?)?;
+    Ok(path)
 }
 
 fn data_flow_node_style(kind: &str) -> (&str, egui::Color32) {

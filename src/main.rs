@@ -1,4 +1,5 @@
 mod app;
+mod mcp_install;
 
 use app::TextViewerApp;
 use eframe::egui;

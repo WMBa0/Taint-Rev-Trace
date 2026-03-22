@@ -58,7 +58,8 @@
             |-- streaming.rs
             |-- engine.rs
             |-- report.rs
-            `-- bin/arm64-taint-cli.rs
+            |-- bin/arm64-taint-cli.rs
+            `-- bin/trace-search-mcp.rs
 ```
 
 ## 运行架构
@@ -181,3 +182,34 @@ cargo run --bin arm64-taint-cli -- <trace-file> --line <line_no> --reg <reg>
 ```bash
 cargo run --bin arm64-taint-cli -- sample.txt --line 72 --reg x8 --bits 0:31
 ```
+
+### MCP
+
+```bash
+cargo run -p arm64-taint-core --bin trace-search-mcp
+```
+
+MCP tools:
+
+- `inspect_content_file`
+- `read_content_lines`
+- `search_content`
+- `replace_content_match`
+- `replace_content_all`
+- `trace_backward`
+- `search_trace_sources`
+
+Coverage:
+
+- file inspection with encoding detection and cached line-index stats
+- line-window reads for large files
+- literal or regex search with pagination and total-count support
+- single-match replace and streaming replace-all workflows
+- standalone backward taint tracing
+- combined search + taint source summarization
+
+Notes:
+
+- this MCP server mirrors the main executable's backend-capable features
+- purely visual GUI controls such as theme, font size, wrap mode, and panel layout remain GUI-only
+- detailed tool explanations and JSON usage examples are in `docs/McpTools.md`
