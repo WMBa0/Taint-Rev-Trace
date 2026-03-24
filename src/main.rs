@@ -38,7 +38,7 @@ fn configure_fonts_linux(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
     // 使用 include_bytes! 宏，直接读取项目根目录下的字体文件
-    let font_data = include_bytes!("../font/simhei.ttf"); // 黑体
+    let font_data = include_bytes!("../font/SourceHanSansSC-Normal.otf"); // 黑体
 
     // 将字体数据插入 egui 字体库
     fonts.font_data.insert(
